@@ -13,6 +13,40 @@ from torch.nn import functional as F
 from typing_extensions import Self
 
 
+cu_seq_len_q = torch.Tensor([0, 1]).cuda().int()
+cu_seq_len_k = torch.Tensor([0, 1]).cuda().int()
+seqlen_k = torch.Tensor([0]).cuda().int()
+
+def faster_sdpa_decode(query, key, value, index_pos):
+    global cu_seq_len_q, cu_seq_len_k, seqlen_k
+    assert index_pos.dim() == 1
+    max_seq_len_q = query.size(2)
+    cu_seq_len_q[-1] = max_seq_len_q
+    cu_seq_len_k[-1] = index_pos[-1] + 1
+    dropout_p = 0.0
+    mask_type = 1
+    log_sumexp = False
+    scale = None
+    causal_diagonal = None
+    seqlen_k[-1] = index_pos[-1] + 1
+    if max_seq_len_q == 1:
+        mask_type = 0
+    out = torch.ops.aten._efficient_attention_forward(
+        query.transpose(1, 2),
+        key.transpose(1, 2),
+        value.transpose(1, 2),
+        None,
+        cu_seq_len_q,
+        cu_seq_len_k,
+        max_seq_len_q,
+        dropout_p=dropout_p,
+        custom_mask_type=mask_type,
+        compute_log_sumexp=log_sumexp,
+        scale=scale,
+        causal_diagonal=causal_diagonal,
+        seqlen_k=seqlen_k,
+    )
+    return out[0].transpose(1, 2)
 
 MaskCache = torch.Tensor
 RoPECache = torch.Tensor
@@ -235,7 +269,8 @@ class CausalSelfAttention(nn.Module):
 
         # efficient attention using Flash Attention CUDA kernels
         # y = F.scaled_dot_product_attention(q, k, v)
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+        # y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+        y = faster_sdpa_decode(q, k, v, input_pos)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
 

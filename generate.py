@@ -7,6 +7,7 @@ from typing import Optional
 
 import lightning as L
 import torch
+from tqdm import tqdm
 
 import torch._dynamo.config
 torch._dynamo.config.automatic_dynamic_shapes = True
@@ -194,7 +195,7 @@ def main(
             torch._inductor.config.coordinate_descent_tuning = True
 
 
-    for i in range(num_samples):
+    for i in tqdm(range(num_samples), desc="Generating samples"):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         import contextlib
@@ -207,11 +208,15 @@ def main(
         t = time.perf_counter() - t0
 
         model.reset_cache()
-        print(tokenizer.decode(y))
+        tqdm.write(f"Sample {i+1}".center(100, "-"))
+        tqdm.write(tokenizer.decode(y))
+        # print(tokenizer.decode(y))
         tokens_generated = y.size(0) - prompt_length
         tokens_sec = tokens_generated / t
-        print(f"Time for inference {i + 1}: {t:.02f} sec total, {tokens_generated / t:.02f} tokens/sec", file=sys.stderr)
-        print(f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s")
+        tqdm.write("\n")
+        tqdm.write(f"Time for inference {i + 1}: {t:.02f} sec total, {tokens_generated / t:.02f} tokens/sec", file=sys.stderr)
+        tqdm.write(f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s")
+        tqdm.write("-".center(100, "-"))
 
     print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB", file=sys.stderr)
 
