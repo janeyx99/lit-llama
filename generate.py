@@ -13,6 +13,7 @@ import torch._dynamo.config
 torch._dynamo.config.automatic_dynamic_shapes = True
 import torch._inductor.config
 torch._inductor.config.triton.unique_kernel_names = True
+torch.set_float32_matmul_precision('high')
 
 # Enable this to bring perf from 93 tok/s => 103 tok/s
 # increases compile time due to coord descent autotuning + compiling both prefill and decode steps
@@ -24,6 +25,7 @@ sys.path.append(str(wd))
 from model import LLaMA
 from tokenizer import Tokenizer
 from utils import lazy_load, llama_model_lookup
+from quant import apply_weight_only_quant
 
 def fast_multinomial_sample_one(probs_sort):
     q = torch.empty_like(probs_sort).exponential_(1)
@@ -141,6 +143,7 @@ def main(
     compile: bool = True,
     profile: Optional[Path] = None,
     max_optimize: bool = False,
+    wo_quant: bool = False,
 ) -> None:
     """Generates text samples based on a pre-trained LLaMA model and tokenizer.
 
@@ -172,9 +175,12 @@ def main(
             model = LLaMA.from_name(name)
 
         if not fake:
-            model.load_state_dict(checkpoint)
+            # Strict = False we need the new buffer info in Causal attention
+            model.load_state_dict(checkpoint, strict=False)
     print(f"Time to load model: {time.time() - t0:.02f} seconds.", file=sys.stderr)
-
+    if wo_quant:
+        print("Applying weight only quantization", file=sys.stderr)
+        apply_weight_only_quant(model)
     model.eval()
 
     tokenizer = Tokenizer(tokenizer_path)
@@ -191,7 +197,7 @@ def main(
 
         # Apparently compiling only prefill but not decode gives bunk results???
         if max_optimize:
-            prefill = torch.compile(prefill, mode="reduce-overhead")
+            # prefill = torch.compile(prefill, mode="reduce-overhead")
             torch._inductor.config.coordinate_descent_tuning = True
 
 
