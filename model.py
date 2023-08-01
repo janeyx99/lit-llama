@@ -101,6 +101,10 @@ class LLaMA(nn.Module):
         self.kv_caches = KVCacheAggregator()
         self.max_batch_size = None
         self.max_seq_length = None
+        
+        self.register_buffer("cu_seq_len_q", torch.Tensor([0, 1]).int().cuda())
+        self.register_buffer("cu_seq_len_k", torch.Tensor([0, 1]).int().cuda())
+        self.register_buffer("seqlen_k", torch.Tensor([0]).int().cuda())
 
     def setup_caches(self, max_batch_size, max_seq_length, device='cuda', dtype=torch.bfloat16):
         head_size = self.config.n_embd // self.config.n_head
@@ -128,7 +132,9 @@ class LLaMA(nn.Module):
         self, idx: torch.Tensor, input_pos: Optional[torch.Tensor] = None
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[KVCache]]]:
         B, T = idx.size()
-
+        self.cu_seq_len_q[-1] = idx.size(-1)
+        self.cu_seq_len_k[-1] = input_pos[-1] + 1
+        self.seqlen_k[-1] = input_pos[-1] + 1
         block_size = self.config.block_size
         max_seq_length = self.max_seq_length
         if max_seq_length is None:
@@ -146,7 +152,7 @@ class LLaMA(nn.Module):
         x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
 
         for i, block in enumerate(self.transformer.h):
-            x, new_kv_cache = block(x, rope, mask, max_seq_length, input_pos, self.kv_caches[i])
+            x, new_kv_cache = block(x, rope, mask, max_seq_length, input_pos, self.kv_caches[i], self.cu_seq_len_q, self.cu_seq_len_k, self.seqlen_k)
 
         x = self.transformer.ln_f(x)
 
@@ -178,8 +184,11 @@ class Block(nn.Module):
         max_seq_length: int,
         input_pos: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
+        cu_seq_len_q: Optional[torch.Tensor] = None,
+        cu_seq_len_k: Optional[torch.Tensor] = None,
+        seqlen_k: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
-        h, new_kv_cache = self.attn(self.rms_1(x), rope, mask, max_seq_length, input_pos, kv_cache)
+        h, new_kv_cache = self.attn(self.rms_1(x), rope, mask, max_seq_length, input_pos, kv_cache, cu_seq_len_q, cu_seq_len_k, seqlen_k)
         x = x + h
         x = x + self.mlp(self.rms_2(x))
         return x, new_kv_cache
@@ -211,22 +220,18 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.block_size = config.block_size
 
-        self.register_buffer("cu_seq_len_q", torch.Tensor([0, 1]).int().cuda())
-        self.register_buffer("cu_seq_len_k", torch.Tensor([0, 1]).int().cuda())
-        self.register_buffer("seqlen_k", torch.Tensor([0]).int().cuda())
-
-
-    def faster_sdpa_decode(self, query, key, value, index_pos):
-        assert index_pos.dim() == 1
+    def faster_sdpa_decode(self, query, key, value, input_pos,
+                           cu_seq_len_q: Optional[torch.Tensor],
+                           cu_seq_len_k: Optional[torch.Tensor],
+                           seqlen_k: Optional[torch.Tensor]):
+        assert input_pos.dim() == 1
         max_seq_len_q = query.size(2)
-        self.cu_seq_len_q[-1] = max_seq_len_q
-        self.cu_seq_len_k[-1] = index_pos[-1] + 1
         dropout_p = 0.0
         mask_type = 1
         log_sumexp = False
         scale = None
         causal_diagonal = None
-        self.seqlen_k[-1] = index_pos[-1] + 1
+
         if max_seq_len_q == 1:
             mask_type = 0
         out = torch.ops.aten._efficient_attention_forward(
@@ -234,15 +239,15 @@ class CausalSelfAttention(nn.Module):
             key.transpose(1, 2),
             value.transpose(1, 2),
             None,
-            self.cu_seq_len_q,
-            self.cu_seq_len_k,
+            cu_seq_len_q,
+            cu_seq_len_k,
             max_seq_len_q,
             dropout_p=dropout_p,
             custom_mask_type=mask_type,
             compute_log_sumexp=log_sumexp,
             scale=scale,
             causal_diagonal=causal_diagonal,
-            seqlen_k=self.seqlen_k,
+            seqlen_k=seqlen_k,
         )
         return out[0].transpose(1, 2)
     
@@ -254,6 +259,9 @@ class CausalSelfAttention(nn.Module):
         max_seq_length: int,
         input_pos: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
+        cu_seq_len_q: Optional[torch.Tensor] = None,
+        cu_seq_len_k: Optional[torch.Tensor] = None,
+        seqlen_k: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
 
@@ -289,7 +297,7 @@ class CausalSelfAttention(nn.Module):
         # y = F.scaled_dot_product_attention(q, k, v)
         # y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
         
-        y = self.faster_sdpa_decode(q, k, v, input_pos)
+        y = self.faster_sdpa_decode(q, k, v, input_pos, cu_seq_len_q, cu_seq_len_k, seqlen_k)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
 
