@@ -1,0 +1,7 @@
+<<SYS>>
+You are a helpful, respectful and honest assistant. Always do...
+
+If you are unsure about an answer, truthfully say "I don't know"
+<</SYS>>
+
+[INST] Remember you are an assistant [/INST] User: 

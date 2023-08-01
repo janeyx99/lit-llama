@@ -7,7 +7,9 @@ from typing import Optional
 
 import lightning as L
 import torch
+from torch.profiler import record_function
 from tqdm import tqdm
+import contextlib
 
 import torch._dynamo.config
 torch._dynamo.config.automatic_dynamic_shapes = True
@@ -77,6 +79,7 @@ def generate(
     temperature: float = 1.0,
     top_k: Optional[int] = None,
     eos_id: Optional[int] = None,
+    profiling: bool = False,
 ) -> torch.Tensor:
     """Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
 
@@ -96,7 +99,9 @@ def generate(
     T_new = T + max_new_tokens
     if max_seq_length is None:
         max_seq_length = min(T_new, model.config.block_size)
-    model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
+    context = contextlib.nullcontext() if not profiling else record_function("setup_caches")
+    with context:
+        model.setup_caches(max_batch_size=1, max_seq_length=max_seq_length)
 
     device, dtype = prompt.device, prompt.dtype
     # create an empty tensor of the expected final shape and fill in the current tokens
@@ -104,28 +109,32 @@ def generate(
     empty[:T] = prompt
     seq = empty
     input_pos = torch.arange(0, T, device=device)
-
-    next_token = prefill(model, input_pos, prompt.view(1, -1), temperature=temperature, top_k=top_k)
+    
+    context = contextlib.nullcontext() if not profiling else record_function("prefill")
+    with context:
+        next_token = prefill(model, input_pos, prompt.view(1, -1), temperature=temperature, top_k=top_k)
     seq[T] = next_token
 
     input_pos = torch.tensor([T], device=device, dtype=input_pos.dtype)
 
-    # generate max_new_tokens tokens
-    for _ in range(max_new_tokens - 1):
-        cur_token = next_token.view(1, -1)
+    context = contextlib.nullcontext() if not profiling else record_function("decode_one_token")
+    with context:
+        # generate max_new_tokens tokens
+        for _ in range(max_new_tokens - 1):
+            cur_token = next_token.view(1, -1)
 
-        # forward
-        next_token = decode_one_token(model, input_pos, cur_token, temperature=temperature, top_k=top_k)
+            # forward
+            next_token = decode_one_token(model, input_pos, cur_token, temperature=temperature, top_k=top_k)
 
-        # advance
-        input_pos = input_pos + 1
+            # advance
+            input_pos = input_pos + 1
 
-        # concatenate the new generation
-        seq[input_pos] = next_token
+            # concatenate the new generation
+            seq[input_pos] = next_token
 
-        # if <eos> token is triggered, return the output (stop generation)
-        if next_token == eos_id:
-            return seq[:input_pos]  # include the EOS token
+            # if <eos> token is triggered, return the output (stop generation)
+            if next_token == eos_id:
+                return seq[:input_pos]  # include the EOS token
 
     return seq
 
@@ -137,13 +146,14 @@ def main(
     max_new_tokens: int = 50,
     top_k: int = 200,
     temperature: float = 0.8,
-    checkpoint_path: Path = Path("checkpoints/lit-llama/7B/lit-llama.pth"),
+    checkpoint_path: Path = Path("checkpoints/lit-llama/llama-2-7b/lit-llama.pth"),
     tokenizer_path: Path = Path("checkpoints/lit-llama/tokenizer.model"),
     fake: bool = False,
     compile: bool = True,
     profile: Optional[Path] = None,
     max_optimize: bool = False,
     wo_quant: bool = False,
+    chat_prompt: bool = False,
 ) -> None:
     """Generates text samples based on a pre-trained LLaMA model and tokenizer.
 
@@ -182,7 +192,12 @@ def main(
         print("Applying weight only quantization", file=sys.stderr)
         apply_weight_only_quant(model)
     model.eval()
-
+    if chat_prompt:
+        with open("prompt.txt", "r") as f:
+            base = f.read()
+    else:
+        base = ""
+    prompt = base + prompt
     tokenizer = Tokenizer(tokenizer_path)
     encoded = tokenizer.encode(prompt, bos=True, eos=False, device=fabric.device)
     if prompt_synthetic is not None:
@@ -191,6 +206,7 @@ def main(
 
     L.seed_everything(1234)
     model_size = sum([p.numel() * p.data.element_size() for p in model.parameters()])
+    print("Loaded a model of total size {:.02f} GB".format(model_size / 1e9), file=sys.stderr)
     if compile:
         global decode_one_token, prefill
         decode_one_token = torch.compile(decode_one_token, mode="reduce-overhead")
@@ -204,10 +220,9 @@ def main(
     for i in tqdm(range(num_samples), desc="Generating samples"):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        import contextlib
         prof = contextlib.nullcontext() if i != num_samples - 1 or not profile else torch.profiler.profile()
         with prof:
-            y = generate(model, encoded, max_new_tokens, temperature=temperature, top_k=top_k)
+            y = generate(model, encoded, max_new_tokens, temperature=temperature, top_k=top_k, profiling = profile is not None)
         if hasattr(prof, "export_chrome_trace"):
             prof.export_chrome_trace(f"{profile}.json")
         torch.cuda.synchronize()
@@ -222,7 +237,6 @@ def main(
         tqdm.write("\n")
         tqdm.write(f"Time for inference {i + 1}: {t:.02f} sec total, {tokens_generated / t:.02f} tokens/sec", file=sys.stderr)
         tqdm.write(f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s")
-        tqdm.write(f"Model size: {model_size / 1e9:.02f} GB")
         tqdm.write("-".center(100, "-"))
 
     print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB", file=sys.stderr)

@@ -30,6 +30,7 @@ class LLaMAConfig:
     padded_vocab_size: Optional[int] = None
     n_layer: int = 32
     n_head: int = 32
+    n_kv_heads: int = 32
     n_embd: int = 4096
 
     def __post_init__(self):
@@ -183,6 +184,16 @@ class Block(nn.Module):
         x = x + self.mlp(self.rms_2(x))
         return x, new_kv_cache
 
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
+    bs, slen, n_kv_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        x[:, :, :, None, :]
+        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
+        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
+    )
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config: LLaMAConfig) -> None:
@@ -195,6 +206,8 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
 
         self.n_head = config.n_head
+        self.n_kv_heads = config.n_head if config.n_kv_heads is None else config.n_kv_heads
+        self.n_rep = self.n_head // self.n_kv_heads
         self.n_embd = config.n_embd
         self.block_size = config.block_size
 
@@ -255,6 +268,10 @@ class CausalSelfAttention(nn.Module):
         q = apply_rope(q, rope)
         k = apply_rope(k, rope)
 
+        # repeat k/v heads if n_kv_heads < n_heads
+        k = repeat_kv(k, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+        v = repeat_kv(v, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+
         k = k.transpose(1, 2)  # (B, nh, T, hs)
         q = q.transpose(1, 2)  # (B, nh, T, hs)
         v = v.transpose(1, 2)  # (B, nh, T, hs)
@@ -271,6 +288,7 @@ class CausalSelfAttention(nn.Module):
         # efficient attention using Flash Attention CUDA kernels
         # y = F.scaled_dot_product_attention(q, k, v)
         # y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+        
         y = self.faster_sdpa_decode(q, k, v, input_pos)
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
