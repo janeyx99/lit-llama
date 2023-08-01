@@ -222,6 +222,7 @@ def main(
         tqdm.write("\n")
         tqdm.write(f"Time for inference {i + 1}: {t:.02f} sec total, {tokens_generated / t:.02f} tokens/sec", file=sys.stderr)
         tqdm.write(f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s")
+        tqdm.write(f"Model size: {model_size / 1e9:.02f} GB")
         tqdm.write("-".center(100, "-"))
 
     print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB", file=sys.stderr)

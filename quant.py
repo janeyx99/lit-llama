@@ -60,8 +60,12 @@ class WeightOnlyQuantLinear(torch.nn.Linear):
         w_int8 = kwargs.pop('w_int8')
         scale = kwargs.pop('scale')
         super().__init__(*args, **kwargs)
-        self.w_int8 = w_int8
-        self.scale = scale
+        self.w_int8 = torch.nn.Parameter(w_int8, requires_grad=False)
+        self.scale = torch.nn.Parameter(scale, requires_grad=False)
+        # self.register_buffer('w_int8', w_int8)
+        # self.register_buffer('scale', scale)
+        # self.w_int8 = w_int8
+        # self.scale = scale
 
     def forward(self, x):
         w_fp16 = dequantize_per_tensor(
