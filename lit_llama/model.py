@@ -6,18 +6,32 @@ Based on the nanoGPT implementation: https://github.com/karpathy/nanoGPT.
 import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
+from enum import Enum
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from typing_extensions import Self
 
-from lit_llama.utils import find_multiple
-
+import transformer_nuggets.quant.qlora as qlora
+from transformer_nuggets.quant import linear_nf4
 
 MaskCache = torch.Tensor
 RoPECache = torch.Tensor
 KVCache = Tuple[torch.Tensor, torch.Tensor]
+
+
+def find_multiple(n: int, k: int) -> int:
+    if n % k == 0:
+        return n
+    return n + k - (n % k)
+
+
+class MLPType(Enum):
+    BnB = "bnb"
+    NF4 = "nf4"
+    Original = "original"
+    QloraNugs = "qlora_nugs"
 
 
 @dataclass
@@ -28,6 +42,7 @@ class LLaMAConfig:
     n_layer: int = 32
     n_head: int = 32
     n_embd: int = 4096
+    mlp_type: MLPType = MLPType.Original
 
     def __post_init__(self):
         if self.padded_vocab_size is None:
@@ -67,21 +82,34 @@ class LLaMA(nn.Module):
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.config.n_layer))
+            torch.nn.init.normal_(
+                module.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.config.n_layer)
+            )
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.config.n_layer))
+            torch.nn.init.normal_(
+                module.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.config.n_layer)
+            )
 
     def forward(
-        self, idx: torch.Tensor, max_seq_length: Optional[int] = None, input_pos: Optional[torch.Tensor] = None
+        self,
+        idx: torch.Tensor,
+        max_seq_length: Optional[int] = None,
+        input_pos: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[KVCache]]]:
         B, T = idx.size()
 
         block_size = self.config.block_size
         if max_seq_length is None:
             max_seq_length = block_size
-        assert T <= max_seq_length, f"Cannot forward sequence of length {T}, max seq length is only {max_seq_length}"
-        assert max_seq_length <= block_size, f"Cannot attend to {max_seq_length}, block size is only {block_size}"
-        assert T <= block_size, f"Cannot forward sequence of length {T}, block size is only {block_size}"
+        assert (
+            T <= max_seq_length
+        ), f"Cannot forward sequence of length {T}, max seq length is only {max_seq_length}"
+        assert (
+            max_seq_length <= block_size
+        ), f"Cannot attend to {max_seq_length}, block size is only {block_size}"
+        assert (
+            T <= block_size
+        ), f"Cannot forward sequence of length {T}, block size is only {block_size}"
 
         if self.rope_cache is None:
             self.rope_cache = self.build_rope_cache(idx)
@@ -98,7 +126,7 @@ class LLaMA(nn.Module):
 
         # forward the model itself
         x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
-
+        
         if input_pos is None:  # proxy for use_cache=False
             for block in self.transformer.h:
                 x, _ = block(x, rope, mask, max_seq_length)
@@ -107,11 +135,16 @@ class LLaMA(nn.Module):
                 head_size = self.config.n_embd // self.config.n_head
                 cache_shape = (B, self.config.n_head, max_seq_length, head_size)
                 self.kv_caches = [
-                    (torch.zeros(cache_shape, device=x.device, dtype=x.dtype), torch.zeros(cache_shape, device=x.device, dtype=x.dtype))
+                    (
+                        torch.zeros(cache_shape, device=x.device, dtype=torch.bfloat16),
+                        torch.zeros(cache_shape, device=x.device, dtype=torch.bfloat16),
+                    )
                     for _ in range(self.config.n_layer)
                 ]
             for i, block in enumerate(self.transformer.h):
-                x, self.kv_caches[i] = block(x, rope, mask, max_seq_length, input_pos, self.kv_caches[i])
+                x, self.kv_caches[i] = block(
+                    x, rope, mask, max_seq_length, input_pos, self.kv_caches[i]
+                )
 
         x = self.transformer.ln_f(x)
 
@@ -132,7 +165,9 @@ class LLaMA(nn.Module):
         )
 
     def build_mask_cache(self, idx: torch.Tensor) -> MaskCache:
-        ones = torch.ones((self.config.block_size, self.config.block_size), device=idx.device, dtype=torch.bool)
+        ones = torch.ones(
+            (self.config.block_size, self.config.block_size), device=idx.device, dtype=torch.bool
+        )
         return torch.tril(ones).unsqueeze(0).unsqueeze(0)
 
     def reset_cache(self) -> None:
@@ -149,7 +184,14 @@ class Block(nn.Module):
         self.rms_1 = RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.rms_2 = RMSNorm(config.n_embd)
-        self.mlp = MLP(config)
+        if config.mlp_type == MLPType.Original:
+            self.mlp = MLP(config)
+        elif config.mlp_type == MLPType.BnB:
+            self.mlp = BnbNF4MLP(config)
+        elif config.mlp_type == MLPType.NF4:
+            self.mlp = NF4MLP.from_config(config)
+        elif config.mlp_type == MLPType.QloraNugs:
+            self.mlp = QloraMLP.from_config(config)
 
     def forward(
         self,
@@ -193,7 +235,7 @@ class CausalSelfAttention(nn.Module):
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-
+        
         head_size = C // self.n_head
         k = k.view(B, T, self.n_head, head_size)
         q = q.view(B, T, self.n_head, head_size)
@@ -201,7 +243,6 @@ class CausalSelfAttention(nn.Module):
 
         q = apply_rope(q, rope)
         k = apply_rope(k, rope)
-
         k = k.transpose(1, 2)  # (B, nh, T, hs)
         q = q.transpose(1, 2)  # (B, nh, T, hs)
         v = v.transpose(1, 2)  # (B, nh, T, hs)
@@ -227,13 +268,78 @@ class CausalSelfAttention(nn.Module):
         # efficient attention using Flash Attention CUDA kernels
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
 
-        y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
+        y = (
+            y.transpose(1, 2).contiguous().view(B, T, C)
+        )  # re-assemble all head outputs side by side
 
         # output projection
         y = self.c_proj(y)
 
         return y, kv_cache
 
+
+class BnbNF4MLP(nn.Module):
+    def __init__(self, config: LLaMAConfig) -> None:
+        super().__init__()
+        weight1, weight2, weight3 = qlora.get_mlp_weights(config.n_embd)
+        device = torch.device("cuda:0")
+        self.w1 = qlora.build_bitsandbytes_linear(weight1, device)
+        self.w2 = qlora.build_bitsandbytes_linear(weight2, device)
+        self.w3 = qlora.build_bitsandbytes_linear(weight3, device)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.silu(self.w1(x)) * self.w2(x)
+        x = self.w3(x)
+        return x
+
+
+class NF4MLP(nn.Module):
+    def __init__(self, weight1: torch.Tensor, weight2: torch.Tensor, weight3:torch.Tensor) -> None:
+        super().__init__()
+        self.w1 = qlora.NF4Tensor.from_tensor(weight1)
+        self.w2 = qlora.NF4Tensor.from_tensor(weight2)
+        self.w3 = qlora.NF4Tensor.from_tensor(weight3)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.silu(linear_nf4(x, self.w1)) * linear_nf4(x, self.w2)
+        x = linear_nf4(x, self.w3)
+        return x
+    
+    @classmethod
+    def from_config(cls, config: LLaMAConfig) -> "NF4MLP":
+        weight1, weight2, weight3 = qlora.get_mlp_weights(config.n_embd)
+        return cls(weight1, weight2, weight3)
+    
+@dataclass
+class QloraConfig:
+    r: int = 2
+    lora_alpha: int = 1
+    lora_dropout: float = 0.0
+
+class QloraMLP(nn.Module):
+    # This very notably doesn't save on backward compute
+    def __init__(self, weight1: torch.Tensor, weight2: torch.Tensor, weight3: torch.Tensor, QloraConfig: QloraConfig = None) -> None:
+        super().__init__()
+        if QloraConfig is None:
+            QloraConfig = QloraConfig()
+
+        r = QloraConfig.r
+        lora_alpha = QloraConfig.lora_alpha
+        lora_dropout = QloraConfig.lora_dropout
+
+        self.qlora_w1 = qlora.QloraLinear(weight1.shape[1], weight1.shape[0], weight1, r, lora_alpha, lora_dropout)
+        self.qlora_w2 = qlora.QloraLinear(weight2.shape[1], weight2.shape[0], weight2, r, lora_alpha, lora_dropout)
+        self.qlora_w3 = qlora.QloraLinear(weight3.shape[1], weight3.shape[0], weight3, r, lora_alpha, lora_dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.silu(self.qlora_w1(x)) * self.qlora_w2(x)
+        x = self.qlora_w3(x)
+        return x
+    
+    @classmethod
+    def from_config(cls, config: LLaMAConfig) -> "QloraMLP":
+        weight1, weight2, weight3 = qlora.get_mlp_weights(config.n_embd)
+        return cls(weight1, weight2, weight3)
 
 class MLP(nn.Module):
     def __init__(self, config: LLaMAConfig) -> None:
@@ -319,3 +425,6 @@ def apply_rope(x: torch.Tensor, rope_cache: RoPECache) -> torch.Tensor:
 
     x_out2 = x_out2.flatten(3)
     return x_out2.type_as(x)
+
+def convert_module_to_qlora(model: LLaMA) -> LLaMA:
+    return model
