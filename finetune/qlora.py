@@ -9,7 +9,6 @@ from pathlib import Path
 import os
 import time
 
-import lightning as L
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -25,12 +24,12 @@ from lit_llama.model import LLaMA, LLaMAConfig, QloraMLP, QloraConfig
 from lit_llama.tokenizer import Tokenizer
 from scripts.prepare_alpaca import generate_prompt
 
+from transformer_nuggets.utils import save_memory_snapshot
 
-from transformer_nuggets.quant.qlora import QloraLinear
 
 instruction_tuning = True
-eval_interval = 50
-save_interval = 100
+eval_interval = 10
+save_interval = 1000
 eval_iters = 100
 log_interval = 1
 
@@ -47,7 +46,7 @@ lora_r = 8
 lora_alpha = 8
 lora_dropout = 0.05
 warmup_iters = 100
-device = torch.device("cuda:7")
+device = torch.device("cuda")
 
 def swap_for_qlora(model: torch.nn.Module) -> None:
     print("Swapping for Qlora...")
@@ -61,10 +60,6 @@ def swap_for_qlora(model: torch.nn.Module) -> None:
 
 def swap_for_qlora_jank(model: torch.nn.Module) -> None:
     print("Swapping for Qlora...")
-    def reset_qlora(module):
-        if isinstance(module, QloraLinear):
-            module.reset_parameters()
-
     for module in tqdm(model.transformer.h):
         current_mlp = module.mlp
         w1 = current_mlp.c_fc1.weight
@@ -72,14 +67,15 @@ def swap_for_qlora_jank(model: torch.nn.Module) -> None:
         w3 = current_mlp.c_proj.weight
         qlora_config = QloraConfig(lora_r, lora_alpha, lora_dropout)
         new_mod = QloraMLP(w1.to(torch.bfloat16), w2.to(torch.bfloat16), w3.to(torch.bfloat16), qlora_config)
-        new_mod.apply(reset_qlora)
         module.mlp = new_mod
+        del current_mlp
 
 def main(
-    data_dir: str = "data/alpaca", 
-    pretrained_path: str = "checkpoints/lit-llama/7B/lit-llama.pth",
-    tokenizer_path: str = "checkpoints/lit-llama/tokenizer.model",
-    out_dir: str = "out/lora/alpaca",
+    data_dir: Path = Path("data/alpaca"), 
+    pretrained_path: Path = Path("checkpoints/lit-llama/llama-2-7b/lit-llama.pth"),
+    tokenizer_path: Path = Path("checkpoints/lit-llama/tokenizer.model"),
+    out_dir: Path = Path("out/lora/alpaca"),
+    compile: bool = False,
 ):  
     random.seed(1337)
     np.random.seed(1337)
@@ -88,32 +84,33 @@ def main(
 
     os.makedirs(out_dir, exist_ok=True)
     train_data, val_data = load_datasets(data_dir=data_dir)
-    config = LLaMAConfig.from_name("7B")
+    config = LLaMAConfig.from_name(str(pretrained_path))
     config.block_size = max_seq_length
-
-    checkpoint = torch.load(pretrained_path)
-
+    
     print("Loading model...")
+    checkpoint = torch.load(pretrained_path, map_location=device)
+    print("Checkpoint loaded")
     with torch.device('meta'):
         model = LLaMA(config)
-        # strict=False because missing keys due to LoRA weights not contained in checkpoint state
 
-    model.load_state_dict(checkpoint, strict=False, assign=True)
+    model.load_state_dict(checkpoint, strict=True, assign=True)
+    model.to(device)
     print("Loaded!")
 
-    # swap_for_qlora(model)
-    model.to(device)
+    # Qlora Module swapping
     swap_for_qlora_jank(model)
-    # lora(r=lora_r, alpha=lora_alpha, dropout=lora_dropout, enabled=True)
     mark_only_lora_as_trainable(model)
-    
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-    # model = torch.compile(model)
+
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    print(f"The number of trainable parameters: {len(trainable_params)}")
+    optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate)
+    if compile:
+        model = torch.compile(model)
     train(model, optimizer, train_data, val_data, tokenizer_path, out_dir)
 
     # Save the final LoRA checkpoint at the end of training
     checkpoint = lora_state_dict(model)
-    # fabric.save(os.path.join(out_dir, "lit-llama-lora-finetuned.pth"), checkpoint)
+    torch.save(checkpoint, out_dir / "lit-llama-qlora.pth")
 
 
 def train(
@@ -130,7 +127,9 @@ def train(
     """
     step_count = 0
     progress_bar = tqdm(total=max_iters)
-
+    # Initial validation
+    val_loss = validate(model, val_data, tokenizer_path)
+    print(f"step {0}: val loss {val_loss:.4f}")
     model.train()
     for iter_num in range(max_iters):
         if step_count <= warmup_iters:
@@ -147,6 +146,8 @@ def train(
             logits = model(input_ids)
 
         loss = loss_fn(logits, targets)
+
+        # Scale the loss by grad_accumulation iters
         (loss/gradient_accumulation_iters).backward()
         
         if (iter_num + 1) % gradient_accumulation_iters == 0:
@@ -163,7 +164,7 @@ def train(
                 # We are only saving the LoRA weights
                 # TODO: Provide a function/script to merge the LoRA weights with pretrained weights
                 checkpoint = lora_state_dict(model)
-                # fabric.save(os.path.join(out_dir, f"iter-{iter_num:06d}-ckpt.pth"), checkpoint)
+                torch.save(checkpoint, out_dir / f"iter-{iter_num:06d}-ckpt.pth")
 
         dt = time.time() - t0
         if iter_num % log_interval == 0:

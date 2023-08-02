@@ -50,6 +50,10 @@ class LLaMAConfig:
 
     @classmethod
     def from_name(cls, name: str) -> Self:
+        if "7b" in name:
+            name = "7B"
+        if "13b" in name:
+            name = "13B"
         return cls(**llama_configs[name])
 
 
