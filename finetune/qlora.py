@@ -19,7 +19,7 @@ wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
 from generate import generate
-from lit_llama.lora import mark_only_lora_as_trainable, lora, lora_state_dict
+from lit_llama.lora import mark_only_lora_as_trainable, lora_state_dict
 from lit_llama.model import LLaMA, LLaMAConfig, QloraMLP, QloraConfig
 from lit_llama.tokenizer import Tokenizer
 from scripts.prepare_alpaca import generate_prompt
@@ -76,6 +76,7 @@ def main(
     tokenizer_path: Path = Path("checkpoints/lit-llama/tokenizer.model"),
     out_dir: Path = Path("out/lora/alpaca"),
     compile: bool = False,
+    process_on_device: bool = False, # This will convert to NF4 on device but not save you from peak gpu memory
 ):  
     random.seed(1337)
     np.random.seed(1337)
@@ -88,18 +89,18 @@ def main(
     config.block_size = max_seq_length
     
     print("Loading model...")
-    checkpoint = torch.load(pretrained_path, map_location=device)
+    map_location = device if process_on_device else None
+    checkpoint = torch.load(pretrained_path, map_location=map_location)
     print("Checkpoint loaded")
     with torch.device('meta'):
         model = LLaMA(config)
-
+    
     model.load_state_dict(checkpoint, strict=True, assign=True)
-    model.to(device)
-    print("Loaded!")
-
-    # Qlora Module swapping
+    # Qlora Module swapping on mmap CPU memory
     swap_for_qlora_jank(model)
     mark_only_lora_as_trainable(model)
+    model.to(device)
+    print("Loaded!")
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     print(f"The number of trainable parameters: {len(trainable_params)}")
