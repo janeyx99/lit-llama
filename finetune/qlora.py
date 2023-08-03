@@ -45,27 +45,18 @@ max_seq_length = 1024  # see scripts/prepare_alpaca.py
 lora_r = 8
 lora_alpha = 8
 lora_dropout = 0.05
+qlora_config = QloraConfig(lora_r, lora_alpha, lora_dropout)
 warmup_iters = 100
 device = torch.device("cuda")
 
-def swap_for_qlora(model: torch.nn.Module) -> None:
-    print("Swapping for Qlora...")
-    for name, child in tqdm(model.named_modules(), total = len(list(model.named_modules()))):
-        if name.endswith("mlp"):
-            w1 = child.c_fc1.weight
-            w2 = child.c_fc2.weight
-            w3 = child.c_proj.weight
-            qlora_config = QloraConfig(lora_r, lora_alpha, lora_dropout)
-            setattr(model, name, QloraMLP(w1.to(torch.bfloat16), w2.to(torch.bfloat16), w3.to(torch.bfloat16), qlora_config))
 
-def swap_for_qlora_jank(model: torch.nn.Module) -> None:
+def swap_for_qlora_jank(model: torch.nn.Module, qlora_config: QloraConfig) -> None:
     print("Swapping for Qlora...")
     for module in tqdm(model.transformer.h):
         current_mlp = module.mlp
         w1 = current_mlp.c_fc1.weight
         w2 = current_mlp.c_fc2.weight
         w3 = current_mlp.c_proj.weight
-        qlora_config = QloraConfig(lora_r, lora_alpha, lora_dropout)
         new_mod = QloraMLP(w1.to(torch.bfloat16), w2.to(torch.bfloat16), w3.to(torch.bfloat16), qlora_config)
         module.mlp = new_mod
         del current_mlp
@@ -97,7 +88,7 @@ def main(
     
     model.load_state_dict(checkpoint, strict=True, assign=True)
     # Qlora Module swapping on mmap CPU memory
-    swap_for_qlora_jank(model)
+    swap_for_qlora_jank(model, qlora_config)
     mark_only_lora_as_trainable(model)
     model.to(device)
     print("Loaded!")
