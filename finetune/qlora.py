@@ -41,7 +41,7 @@ gradient_accumulation_iters = batch_size // micro_batch_size
 assert gradient_accumulation_iters > 0
 max_iters = 50000 * 3 // micro_batch_size
 weight_decay = 0.0
-max_seq_length = 256  # see scripts/prepare_alpaca.py
+max_seq_length = 1024  # see scripts/prepare_alpaca.py
 lora_r = 8
 lora_alpha = 8
 lora_dropout = 0.05

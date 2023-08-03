@@ -268,9 +268,13 @@ class CausalSelfAttention(nn.Module):
         #  att = att.masked_fill(mask[:,:,:T,:T] == 0, float('-inf'))
         #  att = F.softmax(att, dim=-1)
         #  y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-
         # efficient attention using Flash Attention CUDA kernels
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+        # y = F.scaled_dot_product_attention(q, k, v, attn_mask=sdpa_mask, is_causal=mask is None, dropout_p=0.0)
+        with torch.backends.cuda.sdp_kernel(enable_math=False):
+            if input_pos is None:
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True, dropout_p=0.0)
+            else:
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
 
         y = (
             y.transpose(1, 2).contiguous().view(B, T, C)
