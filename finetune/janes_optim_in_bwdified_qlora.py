@@ -27,7 +27,6 @@ from lit_llama.tokenizer import Tokenizer
 from scripts.prepare_alpaca import generate_prompt
 
 from transformer_nuggets.utils import save_memory_snapshot
-from galore_torch import GaLoreAdamW
 
 
 instruction_tuning = True
@@ -53,15 +52,6 @@ warmup_iters = 100
 device = torch.device("cuda")
 fuse_optim_in_backward = False
 
-# GaLore params taken from torchrun_main in GaLore
-use_galore = True
-rank = 128
-update_proj_gap = 50
-galore_scale = 1.0
-proj_type = "std"
-
-fsdp = True
-
 
 def swap_for_qlora_jank(model: torch.nn.Module, qlora_config: QloraConfig) -> None:
     print("Swapping for Qlora...")
@@ -75,14 +65,29 @@ def swap_for_qlora_jank(model: torch.nn.Module, qlora_config: QloraConfig) -> No
         module.mlp = new_mod
         del current_mlp
 
+def add_checkpointing(model: torch.nn.Module) -> None:
+    print("Swapping modules for checkpointing...")
+    print("This code is also useless :p")
+    # breakpoint()
+    for module in tqdm(model.transformer.h):
+        current_rms1_forward = module.rms_1.forward
+        current_rms2_forward = module.rms_2.forward
+        def rms_1_forward(x):
+            return torch.utils.checkpoint.checkpoint(current_rms1_forward, x, use_reentrant=False)
+        def rms_2_forward(x):
+            return torch.utils.checkpoint.checkpoint(current_rms2_forward, x, use_reentrant=False)
+        module.rms_1.forward = rms_1_forward
+        module.rms_2.forward = rms_2_forward
+
+
 def main(
-    data_dir: Path = Path("data/alpaca"),
+    data_dir: Path = Path("data/alpaca"), 
     pretrained_path: Path = Path("checkpoints/lit-llama/llama-2-7b/lit-llama.pth"),
     tokenizer_path: Path = Path("checkpoints/lit-llama/tokenizer.model"),
     out_dir: Path = Path("out/lora/alpaca"),
     compile: bool = False,
     process_on_device: bool = True, # This will convert to NF4 on device but not save you from peak gpu memory
-):
+):  
     random.seed(1337)
     np.random.seed(1337)
     torch.manual_seed(1337)
@@ -92,14 +97,14 @@ def main(
     train_data, val_data = load_datasets(data_dir=data_dir)
     config = LLaMAConfig.from_name(str(pretrained_path))
     config.block_size = max_seq_length
-
+    
     print("Loading model...")
     map_location = device if process_on_device else None
     checkpoint = torch.load(pretrained_path, map_location=map_location)
     print("Checkpoint loaded")
     with torch.device('meta'):
         model = LLaMA(config)
-
+    
     model.load_state_dict(checkpoint, strict=True, assign=True)
     # Qlora Module swapping on mmap CPU memory
     # swap_for_qlora_jank(model, qlora_config)
@@ -107,56 +112,11 @@ def main(
     model.to(device)
     print("Loaded!")
 
-    if fsdp:
-        from torch.distributed._composable.fsdp import fully_shard
-        fsdp_kwargs = {
-        # "cpu_offloading": CPUPolicy()
-        # "mesh": DeviceMesh()
-        }
-        for layer in model.transformer.h:
-            fully_shard(layer, **fsdp_kwargs)
-        fully_shard(model, **fsdp_kwargs)
-
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     print(f"The number of trainable parameters: {len(trainable_params)}")
-
-    if use_galore:
-        # make parameters with "rank" to a single group, if param_name has "mlp" or "attn"
-        galore_params = []
-        target_modules_list = ["attn", "mlp"]
-        for module_name, module in model.named_modules():
-            if not isinstance(module, torch.nn.Linear):
-                continue
-
-            if not any(target_key in module_name for target_key in target_modules_list):
-                continue
-
-            print('enable GaLore for weights in module: ', module_name)
-            galore_params.append(module.weight)
-        id_galore_params = [id(p) for p in galore_params]
-        # make parameters without "rank" to another group
-        regular_params = [p for p in model.parameters() if id(p) not in id_galore_params]
-        # then call galore_adamw
-        param_groups = [{'params': regular_params},
-                        {'params': galore_params, 'rank': rank, 'update_proj_gap': update_proj_gap, 'scale': galore_scale, 'proj_type': proj_type}]
-    else:
-        param_groups = trainable_params
-
-    # print params and trainable params
-    print(f"\n{model}\n")
-    print(f"Total params: {sum(p.numel() for p in model.parameters()) / 1_000_000:.2f}M")
-    print(f"Trainable params: {sum(p.numel() for p in trainable_params) / 1_000_000:.2f}M")
-
-    if use_galore:
-        print(f"Total params with GaLore enabled: {sum(p.numel() for p in galore_params) / 1_000_000:.2f}M")
-
+    
     if compile:
         model = torch.compile(model)
-
-    if use_galore:
-        optim_cls = GaLoreAdamW
-    else:
-        optim_cls = torch.optim.AdamW
 
     if fuse_optim_in_backward:
         optims = {}
@@ -165,16 +125,15 @@ def main(
             optims[tensor].step()
             optims[tensor].zero_grad()
 
-        # DOES NOT WORK WITH GALORE CUZ PARAM_GROUPS NEED TO BE SPLIT
         for p in trainable_params:
-            optims[p] = optim_cls([p], lr=learning_rate)
+            optims[p] = torch.optim.AdamW([p], lr=learning_rate)
             # consider Christian's idea of passing in a torch compiled function here
             # for fast fusion, though this would "just work" by default
             p.register_post_accumulate_grad_hook(optim_hook)
 
         train_with_optim_in_backward(model, optims, train_data, val_data, tokenizer_path, out_dir)
     else:
-        optimizer = optim_cls(param_groups, lr=learning_rate)
+        optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate)
         train(model, optimizer, train_data, val_data, tokenizer_path, out_dir)
 
     # Save the final LoRA checkpoint at the end of training
@@ -226,10 +185,10 @@ def train_with_optim_in_backward(
 
         # Scale the loss by grad_accumulation iters
         (loss/gradient_accumulation_iters).backward()
-
+        
         if (iter_num + 1) % gradient_accumulation_iters == 0:
             step_count += 1
-
+                
             if step_count % eval_interval == 0:
                 val_loss = validate(model, val_data, tokenizer_path)
                 print(f"step {iter_num}: val loss {val_loss:.4f}")
@@ -247,10 +206,10 @@ def train_with_optim_in_backward(
             # progress_bar.set_description(f"Iter {iter_num}: Loss {loss.item():.4f}, Time: {dt*1000:.2f}ms")
             progress_bar.set_postfix_str(f"Iter {iter_num}: Loss {loss.item():.4f}, Time: {dt*1000:.2f}ms")
         progress_bar.update(1)
-
-    # s = torch.cuda.memory._snapshot()
-    # with open(f"{file_path}/snapshot.pickle", "wb") as f:
-    #     dump(s, f)
+    
+    s = torch.cuda.memory._snapshot()
+    with open(f"{file_path}/snapshot.pickle", "wb") as f:
+        dump(s, f)
 
 
 def train(
@@ -295,12 +254,12 @@ def train(
 
         # Scale the loss by grad_accumulation iters
         (loss/gradient_accumulation_iters).backward()
-
+        
         if (iter_num + 1) % gradient_accumulation_iters == 0:
             optimizer.step()
             optimizer.zero_grad()
             step_count += 1
-
+                
             if step_count % eval_interval == 0:
                 val_loss = validate(model, val_data, tokenizer_path)
                 print(f"step {iter_num}: val loss {val_loss:.4f}")
@@ -314,13 +273,13 @@ def train(
 
         dt = time.time() - t0
         if iter_num % log_interval == 0:
-            tqdm.write(f"iter {iter_num}: loss {loss.item():.4f}, time: {dt*1000:.2f}ms")
-            progress_bar.set_description(f"Iter {iter_num}: Loss {loss.item():.4f}, Time: {dt*1000:.2f}ms")
+            # tqdm.write(f"iter {iter_num}: loss {loss.item():.4f}, time: {dt*1000:.2f}ms")
+            # progress_bar.set_description(f"Iter {iter_num}: Loss {loss.item():.4f}, Time: {dt*1000:.2f}ms")
             progress_bar.set_postfix_str(f"Iter {iter_num}: Loss {loss.item():.4f}, Time: {dt*1000:.2f}ms")
         progress_bar.update(1)
-
+    
     s = torch.cuda.memory._snapshot()
-    with open(f"{file_path}/snapshot-{use_galore}.pickle", "wb") as f:
+    with open(f"{file_path}/snapshot.pickle", "wb") as f:
         dump(s, f)
 
 @torch.autocast(device_type='cuda', dtype=torch.bfloat16)
@@ -357,7 +316,7 @@ def validate(model: torch.nn.Module, val_data: np.ndarray, tokenizer_path: str) 
 
     # produce an example:
     instruction = "Recommend a movie for me to watch during the weekend and explain the reason."
-
+    
     output = generate_response(model, instruction, tokenizer_path)
     print(instruction)
     print(output)
@@ -371,7 +330,7 @@ def loss_fn(logits, targets):
     targets = targets[..., 1:].contiguous()
     loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
     return loss
-
+    
 
 def get_batch(data: list):
     ix = torch.randint(len(data), (micro_batch_size,))
@@ -403,7 +362,7 @@ if __name__ == "__main__":
     # Uncomment this line if you see an error: "Expected is_sm80 to be true, but got false"
     # torch.backends.cuda.enable_flash_sdp(False)
     torch.set_float32_matmul_precision("high")
-
+    
     from jsonargparse import CLI
 
     CLI(main)
